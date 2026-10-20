@@ -114,6 +114,22 @@ pub(crate) fn try_walk_parent(
     Some(current)
 }
 
+fn static_ancestor(
+    cu: &llr::CompilationUnit,
+    mut sub_component: llr::SubComponentIdx,
+    level: usize,
+) -> Option<llr::SubComponentIdx> {
+    for _ in 0..level {
+        sub_component = cu.sub_components.iter_enumerated().find_map(|(idx, sc)| {
+            let is_parent = sc.repeated.iter().any(|r| r.sub_tree.root == sub_component)
+                || sc.popup_windows.iter().any(|p| p.item_tree.root == sub_component)
+                || sc.menu_item_trees.iter().any(|t| t.root == sub_component);
+            is_parent.then_some(idx)
+        })?;
+    }
+    Some(sub_component)
+}
+
 /// Walk `parent_level` steps up the parent chain.
 ///
 /// Only for instantiation, where the chain is still alive; evaluation uses [`try_walk_parent`].
@@ -147,10 +163,12 @@ impl i_slint_compiler::llr::TypeResolutionContext for EvalContext {
                 // The `Type` values live in the shared `CompilationUnit`, so
                 // resolve the target sub-component index through the runtime
                 // parent chain and borrow from `cu`.
-                let Some(sub) = try_walk_parent(current, *parent_level) else {
+                let Some(mut sc_idx) = try_walk_parent(current, *parent_level)
+                    .map(|sub| sub.sub_component_idx)
+                    .or_else(|| static_ancestor(cu, current.sub_component_idx, *parent_level))
+                else {
                     return &Type::Invalid;
                 };
-                let mut sc_idx = sub.sub_component_idx;
                 for i in &local_reference.sub_component_path {
                     sc_idx = cu.sub_components[sc_idx].sub_components[*i].ty;
                 }
@@ -344,6 +362,15 @@ fn walk_to_target_with_animation(
     (owner, animation)
 }
 
+/// The value of a property read, or of a callback or function call, when the instance holding it
+/// is gone, like `map_or_default` in the Rust and C++ generators.
+fn default_for_missing_parent(ctx: &EvalContext, mr: &MemberReference) -> Value {
+    match llr::TypeResolutionContext::property_ty(ctx, mr) {
+        Type::Callback(function) => default_value_for_type(&function.return_type),
+        ty => default_value_for_type(ty),
+    }
+}
+
 pub fn load_property(ctx: &EvalContext, mr: &MemberReference) -> Value {
     match mr {
         MemberReference::Global { global_index, member } => {
@@ -353,7 +380,7 @@ pub fn load_property(ctx: &EvalContext, mr: &MemberReference) -> Value {
         }
         MemberReference::Relative { parent_level, local_reference } => {
             let Some(instance) = try_walk_to(ctx, *parent_level, local_reference) else {
-                return Value::Void;
+                return default_for_missing_parent(ctx, mr);
             };
             load_local(&instance, &local_reference.reference)
         }
@@ -402,7 +429,7 @@ pub fn invoke_callback(ctx: &EvalContext, mr: &MemberReference, args: &[Value]) 
         }
         MemberReference::Relative { parent_level, local_reference } => {
             let Some(instance) = try_walk_to(ctx, *parent_level, local_reference) else {
-                return Value::Void;
+                return default_for_missing_parent(ctx, mr);
             };
             match &local_reference.reference {
                 LocalMemberIndex::Callback(idx) => {
@@ -455,7 +482,7 @@ pub fn invoke_function(ctx: &EvalContext, mr: &MemberReference, args: Vec<Value>
         }
         MemberReference::Relative { parent_level, local_reference } => {
             let Some(instance) = try_walk_to(ctx, *parent_level, local_reference) else {
-                return Value::Void;
+                return default_for_missing_parent(ctx, mr);
             };
             let LocalMemberIndex::Function(idx) = &local_reference.reference else {
                 panic!("invoke_function on non-function reference")
